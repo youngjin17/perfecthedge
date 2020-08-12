@@ -29,6 +29,7 @@ class Autotrader:
         self._unilever_total_c = 0
         self._unilever_total_gamma = 0
         self._unilever_total_c, self._unilever_total_gamma, _, _ = estimate_long_run_short_run_relationships(log_stock_values[ORDER_BOOK_Y_ID], log_stock_values[ORDER_BOOK_X_ID])
+        self._unilever_total_last_side = ""
         logger.info(f"For pair Y:{ORDER_BOOK_Y_ID}, X:{ORDER_BOOK_X_ID} c is {self._unilever_total_c} and gamma is {self._unilever_total_gamma}")
 
     def __del__(self):
@@ -63,19 +64,36 @@ class Autotrader:
         positions = self._e.get_positions()
         self._internal_position_unilever = positions[ORDER_BOOK_Y_ID]
         self._internal_position_total = positions[ORDER_BOOK_X_ID]
+        price_bookY = self._e.get_last_price_book(ORDER_BOOK_Y_ID)
+        price_bookX = self._e.get_last_price_book(ORDER_BOOK_X_ID)
 
-        
+        if  not len(price_bookX.bids) or not len(price_bookX.asks) or not len(price_bookY.bids) or not len(price_bookY.asks):
+            logger.error("Could not fill pricebook on startup. Quitting")
+            exit(2)
+
+        # get positions and prices
+        correct_position_x = self._internal_position_total                                  # Sell 100 X
+        correct_position_y = round(self._calculate_hedge_ratio(price_bookX.asks[0].price, price_bookY.bids[0].price) * -correct_position_x)         # Buy 50 Y
+
+        self._missing_hedge = correct_position_y - self._internal_position_unilever         # HAve position 25 Y, Missing hedge is 25
+        logger.info(f"Collected all necessary information. Starting with {ORDER_BOOK_X_ID} position {self._internal_position_total} and {ORDER_BOOK_Y_ID} position {self._internal_position_unilever}. Missing hedge is {self._missing_hedge}")
+
         # Run the actual market operation loop
         while self._e.is_connected:
             self._loop()
             sleep(0.25)
+        
+    def _calculate_hedge_ratio(self, price_x, price_y):
+        #volume_to_hedge = round((self._unilever_total_gamma * price_bookY[0].price / price_bookX[0].price) * change_in_position)
+        return self._unilever_total_gamma * price_y / price_x
+        
 
     # Sanity check on positions: If we screwed up, correct it and log it
     def _sanity_check(self):
         posList = self._e.get_positions()
 
         if posList[ORDER_BOOK_X_ID] != self._internal_position_total:
-            logger.error(f"Actual X position is { posList[ORDER_BOOK_X_ID]}, not self.internal_position_a {self._internal_position_a}")
+            logger.error(f"Actual X position is { posList[ORDER_BOOK_X_ID]}, not self.internal_position_total {self._internal_position_total}")
             self._internal_position_a = posList[ORDER_BOOK_X_ID]
             exit(1)
         if posList[ORDER_BOOK_Y_ID] != self._internal_position_unilever:
@@ -188,7 +206,7 @@ class Autotrader:
             x_t = log(price_bookX.asks[0].price)
             z_t = y_t - self._unilever_total_c - self._unilever_total_gamma * x_t
             logger.info(f"when selling unilever and buying total, y_t = {y_t} x_t = {x_t}, z_t = {z_t}")
-            if z_t > 0:
+            if z_t > 0.005:
                 #insert bid on total
                 logger.info(f"Inserting IOC bid on {ORDER_BOOK_X_ID} at price {price_bookX.asks[0].price} for quantity {6}")
                 #self._e.insert_order(ORDER_BOOK_X_ID, price=price_bookX.asks[0].price, volume=6, side="bid", order_type="ioc")
@@ -197,18 +215,65 @@ class Autotrader:
                 change_in_position = post_trade_position_unilever - self._internal_position_unilever
                 self._internal_position_unilever = post_trade_position_unilever
 
+                # Hedge by asking on Y
                 if change_in_position != 0:
                     logger.info(f"We aquired {change_in_position} new {ORDER_BOOK_X_ID} for the price of {price_bookX.asks[0].price}")
                     # calculate ratio based on gamma * Y_t/X_t. i.e. for every 1 lot in X you want to hedge with 'ratio' lots of Y
-                    volume_to_hedge = round((self._unilever_total_gamma * price_bookY[0].price / price_bookX[0].price) * change_in_position)
-                    # insert ask on unilever
-                    #self._e.insert_order(ORDER_BOOK_Y_ID, price=price_bookY.bids[0].price, volume=volume_to_hedge, side="ask", order_type="ioc")
-                    # look at how much unilever we got, wait for ioc trade
-                    post_trade_position_total = self._e.get_positions()[ORDER_BOOK_Y_ID]
-                    change_in_position = self._internal_position_total - post_trade_position_total
-                    missed_hedge = volume_to_hedge + change_in_position
-                    # handle missed hedge at a later time
-                    logger.warning(f"We missed some hedge. Still need to hedge {missed_hedge} on {ORDER_BOOK_Y_ID}")
+                    volume_to_hedge = round((self._unilever_total_gamma * price_bookY.bids[0].price / price_bookX.asks[0].price) * change_in_position)
+                    hedge_to_issue = volume_to_hedge - self._missing_hedge #volume_to_hedge = 5, missing_hedge = -7, want to hedge 12
+                    if hedge_to_issue > 0:
+                        # insert ask on unilever
+                        #self._e.insert_order(ORDER_BOOK_Y_ID, price=price_bookY.bids[0].price, volume=hedge_to_issue, side="ask", order_type="ioc")
+                        self._missing_hedge = 0
+                        # look at how much unilever we got, wait for ioc trade
+                        post_trade_position_total = self._e.get_positions()[ORDER_BOOK_Y_ID]
+                        change_in_position = self._internal_position_total - post_trade_position_total
+                        logger.info(f"Change in position from selling Y is {change_in_position}")
+                        self._internal_position_total = post_trade_position_total
+                        self._missing_hedge = hedge_to_issue + change_in_position
+                        # handle missed hedge at a later time
+                        logger.warning(f"We missed some hedge. Still need to hedge {self._missing_hedge} on {ORDER_BOOK_Y_ID}")
+                    else:
+                        logger.info(f"Avoided hedging on {ORDER_BOOK_Y_ID} when it would be ill-advised.")
+                        logger.info(f"Missing hedge is {self._missing_hedge}, volume to hedge is {volume_to_hedge}. Setting new missing hedge to {-hedge_to_issue}")
+                        self._missing_hedge = -hedge_to_issue
+        # Buy Y, sell X
+        if len(price_bookY.asks) > 0 and len(price_bookX.bids) > 0:
+            y_t = log(price_bookY.asks[0].price)
+            x_t = log(price_bookX.bids[0].price)
+            z_t = y_t - self._unilever_total_c - self._unilever_total_gamma * x_t
+            logger.info(f"when buying unilever and selling total, y_t = {y_t} x_t = {x_t}, z_t = {z_t}")
+            if z_t < -0.005:
+                #insert bid on total
+                logger.info(f"Inserting IOC ask on {ORDER_BOOK_X_ID} at price {price_bookX.bids[0].price} for quantity {6}")
+                #self._e.insert_order(ORDER_BOOK_X_ID, price=price_bookX.bids[0].price, volume=6, side="asks", order_type="ioc")
+                # look at how much total we got
+                post_trade_position_unilever = self._e.get_positions()[ORDER_BOOK_X_ID]
+                change_in_position = post_trade_position_unilever - self._internal_position_unilever
+                self._internal_position_unilever = post_trade_position_unilever
+
+                # Hedge by bidding on Y
+                if change_in_position != 0:
+                    logger.info(f"We aquired {change_in_position} new {ORDER_BOOK_X_ID} for the price of {price_bookX.bids[0].price}")
+                    # calculate ratio based on gamma * Y_t/X_t. i.e. for every 1 lot in X you want to hedge with 'ratio' lots of Y
+                    volume_to_hedge = round((self._unilever_total_gamma * price_bookY.asks[0].price / price_bookX.bids[0].price) * -change_in_position)
+                    hedge_to_issue = volume_to_hedge + self._missing_hedge #volume_to_hedge = 5, missing_hedge = 7, want to hedge 12
+                    if hedge_to_issue > 0:
+                        # insert bid on unilever
+                        #self._e.insert_order(ORDER_BOOK_Y_ID, price=price_bookY.asks[0].price, volume=hedge_to_issue, side="bid", order_type="ioc")
+                        self._missing_hedge = 0
+                        # look at how much unilever we got, wait for ioc trade
+                        post_trade_position_total = self._e.get_positions()[ORDER_BOOK_Y_ID]
+                        change_in_position = self._internal_position_total - post_trade_position_total
+                        logger.info(f"Change in position from buying Y is {change_in_position}")
+                        self._internal_position_total = post_trade_position_total
+                        self._missing_hedge = hedge_to_issue - change_in_position
+                        # handle missed hedge at a later time
+                        logger.warning(f"We missed some hedge. Still need to hedge {self._missing_hedge} on {ORDER_BOOK_Y_ID}")
+                    else:
+                        logger.info(f"Avoided hedging on {ORDER_BOOK_Y_ID} when it would be ill-advised.")
+                        logger.info(f"Missing hedge is {self._missing_hedge}, volume to hedge is {volume_to_hedge}. Setting new missing hedge to {-hedge_to_issue}")
+                        self._missing_hedge = hedge_to_issue
                     
         
     def _process_hedge_trades(self):
