@@ -227,7 +227,7 @@ class Autotrader:
                         self._missing_hedge = 0
                         # look at how much unilever we got, wait for ioc trade
                         post_trade_position_total = self._e.get_positions()[ORDER_BOOK_Y_ID]
-                        change_in_position = self._internal_position_total - post_trade_position_total
+                        change_in_position = post_trade_position_total - self._internal_position_total
                         logger.info(f"Change in position from selling Y is {change_in_position}")
                         self._internal_position_total = post_trade_position_total
                         self._missing_hedge = hedge_to_issue + change_in_position
