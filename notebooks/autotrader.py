@@ -27,7 +27,8 @@ class Autotrader:
     def __init__(self, host, username, password, log_stock_values):
         self._e = Exchange(host=host)
         self._a = self._e.connect(username=username, password=password)
-        self.unilever_total_trader = Pair_Trader(self, "UNILEVER", "TOTAL", log_stock_values, 0.001)
+        # self.unilever_total_trader = Pair_Trader(self, "UNILEVER", "TOTAL", log_stock_values, 0.4)
+        self.lvmh_allianz_trader = Pair_Trader(self, "ALLIANZ", "LVMH", log_stock_values, 0.1)
 
     def __del__(self):
         self._e.disconnect()
@@ -66,18 +67,19 @@ class Autotrader:
             logger.error("Must be connected to exchange before calling. Quitting!")
             exit(1)
 
-        self.unilever_total_trader.get_initial_data()
-
+        # self.unilever_total_trader.get_initial_data()
+        self.lvmh_allianz_trader.get_initial_data()
         # Run the actual market operation loop
         while self._e.is_connected():
-            self.unilever_total_trader.single_loop_iteration()
+            # self.unilever_total_trader.single_loop_iteration()
+            self.lvmh_allianz_trader.single_loop_iteration()
             sleep(0.01)
 
 class Pair_Trader:
-    def __init__(self, autotrader: Autotrader, stock_y_id: str, stock_x_id: str, log_stock_values: Dict[str, List[float]], required_z: float):
+    def __init__(self, autotrader: Autotrader, stock_y_id: str, stock_x_id: str, log_stock_values: Dict[str, List[float]], required_credit: float):
         self.stock_x_id = stock_x_id
         self.stock_y_id = stock_y_id
-        self.required_z = required_z
+        self.required_credit = required_credit
         self._at = autotrader
         self._c, self._gamma, _, _ = estimate_long_run_short_run_relationships(log_stock_values[stock_y_id], log_stock_values[stock_x_id])
         logger.info(f"For pair Y:{stock_y_id}, X:{stock_x_id} c is {self._c} and gamma is {self._gamma}")
@@ -128,7 +130,7 @@ class Pair_Trader:
             implied_Y = exp(implied_y_t)
             credit = order_book_y.bids[0].price - implied_Y
             # logger.info(f"z_t for buying x, selling y: {z_t}. Seeing credit of {credit}")
-            if (credit > 0.1 and self._internal_position_y > -200 and order_book_y.bids[0].volume >= 20):
+            if (credit > self.required_credit and self._internal_position_y > -50 and order_book_y.bids[0].volume >= 20):
                 # Insert Bid on X, Hedge with Ask on Y
                 #logger.info(f"when selling {self.stock_y_id} and buying {self.stock_x_id}, y_t = {y_t} x_t = {x_t}, z_t = {z_t}. Credit is {credit}")
                 self._buy_x_sell_y(order_book_x, order_book_y)
@@ -145,7 +147,7 @@ class Pair_Trader:
             implied_Y = exp(implied_y_t)
             credit = implied_Y - order_book_y.asks[0].price
             # logger.info(f"z_t for selling x, buying y: {z_t}. Seeing credit of {credit}")
-            if (credit > 0.1 and self._internal_position_y < 200 and order_book_y.asks[0].volume >= 20):
+            if (credit > self.required_credit and self._internal_position_y < 50 and order_book_y.asks[0].volume >= 20):
                 # Insert Ask on X, Hedge with Bid on Y
                 #logger.info(f"when buying {self.stock_y_id} and selling {self.stock_x_id}, y_t = {y_t} x_t = {x_t}, z_t = {z_t}. Credit is {credit}")
                 self._sell_x_buy_y(order_book_x, order_book_y)
