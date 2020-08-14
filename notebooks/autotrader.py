@@ -28,7 +28,7 @@ class Autotrader:
         self._e = Exchange(host=host)
         self._a = self._e.connect(username=username, password=password)
         # self.unilever_total_trader = Pair_Trader(self, "UNILEVER", "TOTAL", log_stock_values, 0.4)
-        self.lvmh_allianz_trader = Pair_Trader(self, "ALLIANZ", "LVMH", log_stock_values, 0.1)
+        self.lvmh_allianz_trader = Pair_Trader(self, "ALLIANZ", "LVMH", log_stock_values, 0.1, 50, "limit")
 
     def __del__(self):
         self._e.disconnect()
@@ -76,17 +76,23 @@ class Autotrader:
             sleep(0.01)
 
 class Pair_Trader:
-    def __init__(self, autotrader: Autotrader, stock_y_id: str, stock_x_id: str, log_stock_values: Dict[str, List[float]], required_credit: float):
+    def __init__(self, autotrader: Autotrader, stock_y_id: str, stock_x_id: str, log_stock_values: Dict[str, List[float]], required_credit: float, risk_limit: int = 50, hedge_type: str = "ioc"):
+        assert risk_limit > 0 and risk_limit < 500, "Risk limit must be between 0 and 500" # Limits set by exchange
+        assert hedge_type == "ioc" or hedge_type == "limit", "Can only hedge with limit or IOC orders"
+        assert required_credit > 0, "Required credit can't be negative or we will lose money"
         self.stock_x_id = stock_x_id
         self.stock_y_id = stock_y_id
         self.required_credit = required_credit
         self._at = autotrader
+        self._internal_risk_limit = risk_limit
+        self._hedge_type = hedge_type
         self._c, self._gamma, _, _ = estimate_long_run_short_run_relationships(log_stock_values[stock_y_id], log_stock_values[stock_x_id])
         logger.info(f"For pair Y:{stock_y_id}, X:{stock_x_id} c is {self._c} and gamma is {self._gamma}")
         self._internal_position_x = 0
         self._internal_position_y = 0
         self._missing_hedge = 0
         self._hedge_timer = 0
+        self._limit_order_out = False
         self._sanity_check_counter = SANITY_CHECK_RESET
     
     def get_initial_data(self):
@@ -106,6 +112,9 @@ class Pair_Trader:
         logger.info(f"Collected all necessary information. {self.stock_y_id} position {self._internal_position_y} and {self.stock_x_id} position {self._internal_position_x} with missing hedge {self._missing_hedge}")
     
     def single_loop_iteration(self):
+        if self._hedge_type == "limit" and self._missing_hedge != 0 and self._limit_order_out:
+            self._process_limit_hedges()
+        
         if self._sanity_check_counter == 0:
             self._sanity_check()
             self._sanity_check_counter = SANITY_CHECK_RESET
@@ -130,7 +139,7 @@ class Pair_Trader:
             implied_Y = exp(implied_y_t)
             credit = order_book_y.bids[0].price - implied_Y
             # logger.info(f"z_t for buying x, selling y: {z_t}. Seeing credit of {credit}")
-            if (credit > self.required_credit and self._internal_position_y > -50 and order_book_y.bids[0].volume >= 20):
+            if (credit > self.required_credit and self._internal_position_y > -self._internal_risk_limit and order_book_y.bids[0].volume >= 20):
                 # Insert Bid on X, Hedge with Ask on Y
                 #logger.info(f"when selling {self.stock_y_id} and buying {self.stock_x_id}, y_t = {y_t} x_t = {x_t}, z_t = {z_t}. Credit is {credit}")
                 self._buy_x_sell_y(order_book_x, order_book_y)
@@ -147,7 +156,7 @@ class Pair_Trader:
             implied_Y = exp(implied_y_t)
             credit = implied_Y - order_book_y.asks[0].price
             # logger.info(f"z_t for selling x, buying y: {z_t}. Seeing credit of {credit}")
-            if (credit > self.required_credit and self._internal_position_y < 50 and order_book_y.asks[0].volume >= 20):
+            if (credit > self.required_credit and self._internal_position_y < self._internal_risk_limit and order_book_y.asks[0].volume >= 20):
                 # Insert Ask on X, Hedge with Bid on Y
                 #logger.info(f"when buying {self.stock_y_id} and selling {self.stock_x_id}, y_t = {y_t} x_t = {x_t}, z_t = {z_t}. Credit is {credit}")
                 self._sell_x_buy_y(order_book_x, order_book_y)
@@ -191,7 +200,7 @@ class Pair_Trader:
             hedge_to_issue = volume_to_hedge - self._missing_hedge #volume_to_hedge = 16, missing_hedge = -32, want to hedge -16
             if hedge_to_issue > 0:
                 # insert ask on unilever
-                self._at.insert_order(self.stock_y_id, price=order_book_y.bids[0].price, volume=hedge_to_issue, side="ask", order_type="ioc")
+                self._at.insert_order(self.stock_y_id, price=order_book_y.bids[0].price, volume=hedge_to_issue, side="ask", order_type=self._hedge_type)
                 logger.info(f"We aquired {change_in_position} new {self.stock_x_id} for the price of {order_book_x.asks[0].price}")
                 logger.info(f"We are trying to hedge {hedge_to_issue} by selling on {self.stock_y_id} at price {order_book_y.bids[0].price}. Missing_hedge is currently {self._missing_hedge}")
                 self._missing_hedge = 0
@@ -204,6 +213,7 @@ class Pair_Trader:
                 # handle missed hedge at a later time
                 if self._missing_hedge: 
                     logger.warning(f"We missed some hedge. Still need to hedge {self._missing_hedge} on {self.stock_y_id}")
+                    self._limit_order_out = (self._hedge_type == "limit")
                     self._hedge_timer = HEDGE_TIMER_RESET
             else:
                 logger.info(f"We aquired {change_in_position} new {self.stock_x_id} for the price of {order_book_x.asks[0].price}")
@@ -227,7 +237,7 @@ class Pair_Trader:
             hedge_to_issue = volume_to_hedge + self._missing_hedge #volume_to_hedge = 5, missing_hedge = 7, want to hedge 12
             if hedge_to_issue > 0:
                 # insert bid on unilever
-                self._at.insert_order(self.stock_y_id, price=order_book_y.asks[0].price, volume=hedge_to_issue, side="bid", order_type="ioc")
+                self._at.insert_order(self.stock_y_id, price=order_book_y.asks[0].price, volume=hedge_to_issue, side="bid", order_type=self._hedge_type)
                 logger.info(f"We aquired {change_in_position} new {self.stock_x_id} for the price of {order_book_x.bids[0].price}")
                 logger.info(f"We are trying to hedge {hedge_to_issue} by buying on {self.stock_y_id} at price {order_book_y.asks[0].price}. Missing_hedge is currently {self._missing_hedge}")
                 self._missing_hedge = 0
@@ -240,6 +250,7 @@ class Pair_Trader:
                 # handle missed hedge at a later time
                 if self._missing_hedge:
                     logger.warning(f"We missed some hedge. Still need to hedge {self._missing_hedge} on {self.stock_y_id}")
+                    self._limit_order_out = (self._hedge_type == "limit")
                     self._hedge_timer = HEDGE_TIMER_RESET
             else:
                 logger.info(f"We aquired {change_in_position} new {self.stock_x_id} for the price of {order_book_x.bids[0].price}")
@@ -262,6 +273,36 @@ class Pair_Trader:
         self._missing_hedge = self._missing_hedge - change_in_position
         self._internal_position_y = post_trade_position_y
         logger.info(f"Change in position from hedge fill is {change_in_position}. Setting new missing hedge to {self._missing_hedge}")
+    
+    def _process_limit_hedges(self):
+        self._at.delete_all_orders(self.stock_y_id)
+        post_limit_position_y = self._at.get_position(self.stock_y_id)
+        change_in_position = post_limit_position_y - self._internal_position_y
+        self._internal_position_y = post_limit_position_y
+        self._missing_hedge = self._missing_hedge - change_in_position
+
+        logger.info(f"Pulling limit orders from hedge {self.stock_y_id}. Leaving limit out aquired {change_in_position} shares compared to required {self._missing_hedge}")
+        self._limit_order_out = False
+
+        if self._missing_hedge != 0:
+            # Still need to insert IOC for trade
+            order_book_y = self._at.get_order_book(self.stock_y_id)
+
+            if self._missing_hedge < 0:
+                if len(order_book_y.bids) == 0: return # can't hedge w/o price
+                self._at.insert_order(self.stock_y_id, price=order_book_y.bids[0].price, volume=-self._missing_hedge, side="ask", order_type="ioc")
+                logger.info(f"Inserting IOC ask on {self.stock_y_id} to finish filling hedge price {order_book_y.bids[0].price} quantity {self._missing_hedge}")
+            else:
+                if len(order_book_y.asks) == 0: return # can't hedge w/o price
+                self._at.insert_order(self.stock_y_id, price=order_book_y.asks[0].price, volume=-self._missing_hedge, side="ask", order_type="ioc")
+                logger.info(f"Inserting IOC ask on {self.stock_y_id} to finish filling hedge price {order_book_y.bids[0].price} quantity {self._missing_hedge}")
+            
+            post_limit_position_y = self._at.get_position(self.stock_y_id)
+            change_in_position = post_limit_position_y - self._internal_position_y
+            self._internal_position_y = post_limit_position_y
+            self._missing_hedge = self._missing_hedge - change_in_position
+
+            logger.info(f"IOC hedge on {self.stock_y_id} after incomplete limits yielded {change_in_position} new quanity. Missing hedge is now {self._missing_hedge}")
 
 # Used to initialize values
 def read_data(timestamps_pckl, stock_values_pckl):
