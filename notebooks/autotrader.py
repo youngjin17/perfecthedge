@@ -1,4 +1,5 @@
 import pickle
+import random
 from math import ceil, log, exp
 from typing import Dict, List
 from cointegration_analysis import estimate_long_run_short_run_relationships
@@ -10,26 +11,20 @@ import logging
 logger = logging.getLogger('client')
 logger.setLevel('INFO')
 
-
-ORDER_BOOK_X_ID = "TOTAL"
-ORDER_BOOK_Y_ID = "UNILEVER"
 SANITY_CHECK_RESET = 150
 HEDGE_TIMER_RESET = 400
-
-# Check the position before each hedge order and base hedge amount on that
-
-# or
-
-# Assume no missing hedge, and place limit orders for full hedge each time
-#   every 200 cycles, pull all outstanding limit orders and fill missing hedge
 
 class Autotrader:
     def __init__(self, host, username, password, log_stock_values):
         self._e = Exchange(host=host)
         self._a = self._e.connect(username=username, password=password)
-        self.unilever_total_trader = Pair_Trader(self, "UNILEVER", "TOTAL", log_stock_values, 0.1, 60, "limit")
-        self.lvmh_allianz_trader = Pair_Trader(self, "ALLIANZ", "LVMH", log_stock_values, 0.1, 50, "limit")
-        self.asml_sap_trader = Pair_Trader(self, "ASML", "SAP", log_stock_values, 0.1, 50, "limit")
+        self.lvmh_allianz_trader = Pair_Trader(self, "ALLIANZ", "LVMH", log_stock_values, 0.1, 300, "limit")
+        self.asml_sap_trader = Pair_Trader(self, "ASML", "SAP", log_stock_values, 0.2, 300, "limit")
+
+        # These two only trade in one direction
+        self.airbus_siemens_trader = Pair_Trader(self, "SIEMENS", "AIRBUS", log_stock_values, 0.3, 100, "limit")
+        self.unilever_total_trader = Pair_Trader(self, "UNILEVER", "TOTAL", log_stock_values, 0.2, 150, "limit")
+
 
     def __del__(self):
         self._e.disconnect()
@@ -43,22 +38,22 @@ class Autotrader:
         for bid in pb.bids:
             logger.debug("| {:=3} | {:^{width}.2f} |     |".format(bid.volume, bid.price, width=7))
         logger.debug("|-----|---------|-----|")
-    
+
     def insert_order(self, order_book_id: str, price: float, volume: int, side: str, order_type: str) -> int:
         assert volume > 0 and volume < 500, "Volume must be between 0 and 500"
         assert price > 0, "Price must be greater than 0"
         return self._e.insert_order(order_book_id, price=round(price, 2), volume=volume, side=side, order_type=order_type)
-    
+
     def delete_order(self, order_book_id: str, order_id: int) -> bool:
         assert order_id > 0
         return self._e.delete_order(order_book_id, order_id=order_id)
-    
+
     def delete_all_orders(self, order_book_id: str) -> None:
         self._e.delete_orders(order_book_id)
 
     def get_order_book(self, order_book_id: str):
         return self._e.get_last_price_book(order_book_id)
-    
+
     def get_position(self, order_book_id: str) -> int:
         return self._e.get_positions()[order_book_id]
 
@@ -68,24 +63,29 @@ class Autotrader:
             logger.error("Must be connected to exchange before calling. Quitting!")
             exit(1)
 
-        self.unilever_total_trader.get_initial_data()
         self.lvmh_allianz_trader.get_initial_data()
         self.asml_sap_trader.get_initial_data()
+        self.unilever_total_trader.get_initial_data()
+        self.airbus_siemens_trader.get_initial_data()
+        self.unilever_total_trader.exit_position_negative = True
+        self.airbus_siemens_trader.exit_position_negative = True
         # Run the actual market operation loop
         while self._e.is_connected():
             self.unilever_total_trader.single_loop_iteration()
             self.lvmh_allianz_trader.single_loop_iteration()
             self.asml_sap_trader.single_loop_iteration()
+            self.airbus_siemens_trader.single_loop_iteration()
             #sleep(0.01)
 
 class Pair_Trader:
     def __init__(self, autotrader: Autotrader, stock_y_id: str, stock_x_id: str, log_stock_values: Dict[str, List[float]], required_credit: float, risk_limit: int = 50, hedge_type: str = "ioc"):
-        assert risk_limit > 0 and risk_limit < 500, "Risk limit must be between 0 and 500" # Limits set by exchange
+        assert risk_limit > 0 and risk_limit <= 500, "Risk limit must be between 0 and 500" # Limits set by exchange
         assert hedge_type == "ioc" or hedge_type == "limit", "Can only hedge with limit or IOC orders"
-        assert required_credit > 0, "Required credit can't be negative or we will lose money"
+        assert required_credit >= 0, "Required credit can't be negative or we will lose money"
         self.stock_x_id = stock_x_id
         self.stock_y_id = stock_y_id
         self.required_credit = required_credit
+        self.exit_position_negative = False
         self._at = autotrader
         self._internal_risk_limit = risk_limit
         self._hedge_type = hedge_type
@@ -97,7 +97,7 @@ class Pair_Trader:
         self._hedge_timer = 0
         self._limit_order_out = False
         self._sanity_check_counter = SANITY_CHECK_RESET
-    
+
     def get_initial_data(self):
         self._internal_position_x = self._at.get_position(self.stock_x_id)
         self._internal_position_y = self._at.get_position(self.stock_y_id)
@@ -113,17 +113,17 @@ class Pair_Trader:
         self._missing_hedge = correct_position_y - self._internal_position_y
 
         logger.info(f"Collected all necessary information. {self.stock_y_id} position {self._internal_position_y} and {self.stock_x_id} position {self._internal_position_x} with missing hedge {self._missing_hedge}")
-    
+
     def single_loop_iteration(self):
         if self._hedge_type == "limit" and self._missing_hedge != 0 and self._limit_order_out:
             self._process_limit_hedges()
-        
+
         if self._sanity_check_counter == 0:
             self._sanity_check()
-            self._sanity_check_counter = SANITY_CHECK_RESET
+            self._sanity_check_counter = random.randrange(0, SANITY_CHECK_RESET/10) # + SANITY_CHECK_RESET
         else:
             self._sanity_check_counter -= 1
-        
+
         order_book_x = self._at.get_order_book(self.stock_x_id)
         order_book_y = self._at.get_order_book(self.stock_y_id)
 
@@ -137,44 +137,38 @@ class Pair_Trader:
         if len(order_book_y.bids) > 0 and len(order_book_x.asks) > 0:
             y_t = log(order_book_y.bids[0].price)
             x_t = log(order_book_x.asks[0].price)
-            z_t = y_t - self._c - self._gamma * x_t
+            #z_t = y_t - self._c - self._gamma * x_t
             implied_y_t = self._c + self._gamma * x_t
             implied_Y = exp(implied_y_t)
             credit = order_book_y.bids[0].price - implied_Y
+            volume = self._calculate_volume_from_credit(credit, order_book_y.bids[0].volume, "bid", order_book_x.asks[0].price, order_book_y.bids[0].price)
             # logger.info(f"z_t for buying x, selling y: {z_t}. Seeing credit of {credit}")
-            if (
-                (credit > self.required_credit or (credit > 0 and self._internal_position_y > 0)) and
-                self._internal_position_y > -self._internal_risk_limit and
-                order_book_y.bids[0].volume >= 20
-            ):
+            if (self._internal_position_y > -self._internal_risk_limit and volume > 0):
                 # Insert Bid on X, Hedge with Ask on Y
                 # logger.info(f"when selling {self.stock_y_id} and buying {self.stock_x_id}, y_t = {y_t} x_t = {x_t}, z_t = {z_t}. Credit is {credit}")
-                self._buy_x_sell_y(order_book_x, order_book_y)
+                self._buy_x_sell_y(order_book_x, order_book_y, volume)
 
                 # it's likely market has since moved, so get price books again
                 order_book_x = self._at.get_order_book(self.stock_x_id)
                 order_book_y = self._at.get_order_book(self.stock_y_id)
-        
+
         if len(order_book_y.asks) > 0 and len(order_book_x.bids) > 0:
             y_t = log(order_book_y.asks[0].price)
             x_t = log(order_book_x.bids[0].price)
-            z_t = y_t - self._c - self._gamma * x_t
+            #z_t = y_t - self._c - self._gamma * x_t
             implied_y_t = self._c + self._gamma * x_t
             implied_Y = exp(implied_y_t)
             credit = implied_Y - order_book_y.asks[0].price
+            volume = self._calculate_volume_from_credit(credit, order_book_y.asks[0].volume, "ask", order_book_x.bids[0].price, order_book_y.asks[0].price)
             # logger.info(f"z_t for selling x, buying y: {z_t}. Seeing credit of {credit}")
-            if (
-                (credit > self.required_credit or (credit > 0 and self._internal_position_y < 0)) and 
-                self._internal_position_y < self._internal_risk_limit and 
-                order_book_y.asks[0].volume >= 20
-            ):
+            if (self._internal_position_y < self._internal_risk_limit and volume > 0):
                 # Insert Ask on X, Hedge with Bid on Y
                 # logger.info(f"when buying {self.stock_y_id} and selling {self.stock_x_id}, y_t = {y_t} x_t = {x_t}, z_t = {z_t}. Credit is {credit}")
-                self._sell_x_buy_y(order_book_x, order_book_y)
-    
+                self._sell_x_buy_y(order_book_x, order_book_y, volume)
+
     def _calculate_hedge_amount(self, price_x: float, price_y: float, quantity_x: int) -> int:
         return round((self._gamma * price_x / price_y) * -quantity_x)
-    
+
     def _sanity_check(self):
         if self._at.get_position(self.stock_x_id) != self._internal_position_x:
             logger.error(f"Actual {self.stock_x_id} position is {self._at.get_position(self.stock_x_id)}, not self.internal_position_x {self._internal_position_x}")
@@ -182,7 +176,7 @@ class Pair_Trader:
         if self._at.get_position(self.stock_y_id) != self._internal_position_y:
             logger.error(f"Actual Y position is {self._at.get_position(self.stock_y_id)}, not self.internal_position_y {self._internal_position_y}")
             exit(1)
-        
+
         # Check for proper missing hedge count
         order_book_x = self._at.get_order_book(self.stock_x_id)
         order_book_y = self._at.get_order_book(self.stock_y_id)
@@ -194,11 +188,46 @@ class Pair_Trader:
             # exit(1)
         self._missing_hedge = correct_position_y - self._internal_position_y
         logger.debug("Passed sanity check.")
-    
-    def _buy_x_sell_y(self, order_book_x, order_book_y):
+
+    def _calculate_volume_from_credit(self, credit: float, hedge_volume: int, x_side: str, price_x: float, price_y: float) -> int:
+        available_volume = int(self._gamma * price_y / price_x * hedge_volume)  # Truncate not round just to be safe
+
+        if (
+            (x_side == "bid" and self._internal_position_y > 0) or
+            (x_side == "ask" and self._internal_position_y < 0)
+        ):
+            if self.exit_position_negative and credit > -self.required_credit + .2:
+                return min(available_volume, abs(self._internal_position_y))
+            elif credit > self.required_credit:
+                return min(available_volume, abs(self._internal_position_y))
+            else: return 0
+
+        if credit < self.required_credit: return 0
+
+        greater_internal_position = max(abs(self._internal_position_y), abs(self._internal_position_x))
+
+        if credit > self.required_credit and greater_internal_position <= self._internal_risk_limit / 10:
+            return min(available_volume, 10)
+        if credit > self.required_credit * 2 and greater_internal_position <= self._internal_risk_limit / 4:
+            return min(available_volume, 15)
+        if credit > self.required_credit * 4 and greater_internal_position <= self._internal_risk_limit / 2:
+            return min(available_volume, 20)
+        if credit > self.required_credit * 7 and greater_internal_position <= self._internal_risk_limit * 7/10:
+            return min(available_volume, 15)
+        if credit > self.required_credit * 10 and greater_internal_position <= self._internal_risk_limit * 4/5:
+            return min(available_volume, 10)
+        if credit > self.required_credit * 15 and greater_internal_position <= 450:
+            #logger.info(f"Seeing high credit {credit} on pair X:{self.stock_x_id} Y:{self.stock_y_id} that we only issue order for 1 of due to position")
+            return 1
+        if greater_internal_position > 450:
+            return 0
+
+        return 0
+
+    def _buy_x_sell_y(self, order_book_x, order_book_y, volume):
         #insert bid on total
-        self._at.insert_order(self.stock_x_id, price=order_book_x.asks[0].price, volume=6, side="bid", order_type="ioc")
-        
+        self._at.insert_order(self.stock_x_id, price=order_book_x.asks[0].price, volume=volume, side="bid", order_type="ioc")
+
         # look at how much total we got
         post_trade_position_x = self._at.get_position(self.stock_x_id)
         change_in_position = post_trade_position_x - self._internal_position_x
@@ -233,9 +262,9 @@ class Pair_Trader:
                 self._missing_hedge = -hedge_to_issue
         else:
             logger.info(f"Inserted IOC bid on {self.stock_x_id} at price {order_book_x.asks[0].price} for quantity {6} but missed")
-    
-    def _sell_x_buy_y(self, order_book_x, order_book_y):
-        self._at.insert_order(self.stock_x_id, price=order_book_x.bids[0].price, volume=6, side="ask", order_type="ioc")
+
+    def _sell_x_buy_y(self, order_book_x, order_book_y, volume):
+        self._at.insert_order(self.stock_x_id, price=order_book_x.bids[0].price, volume=volume, side="ask", order_type="ioc")
         # look at how much total we got
         post_trade_position_x = self._at.get_position(self.stock_x_id)
         change_in_position = post_trade_position_x - self._internal_position_x
@@ -270,7 +299,7 @@ class Pair_Trader:
                 self._missing_hedge = hedge_to_issue
         else:
             logger.info(f"Inserted IOC ask on {self.stock_x_id} at price {order_book_x.bids[0].price} for quantity {6} but missed")
-    
+
     def _fill_hedges(self, order_book_y):
         if len(order_book_y.bids) > 0 and self._missing_hedge < 0:
             self._at.insert_order(self.stock_y_id, price=order_book_y.bids[0].price, volume=-self._missing_hedge, side="ask", order_type="ioc")
@@ -284,7 +313,7 @@ class Pair_Trader:
         self._missing_hedge = self._missing_hedge - change_in_position
         self._internal_position_y = post_trade_position_y
         logger.info(f"Change in position from hedge fill is {change_in_position}. Setting new missing hedge to {self._missing_hedge}")
-    
+
     def _process_limit_hedges(self):
         self._at.delete_all_orders(self.stock_y_id)
         post_limit_position_y = self._at.get_position(self.stock_y_id)
@@ -307,7 +336,7 @@ class Pair_Trader:
                 if len(order_book_y.asks) == 0: return # can't hedge w/o price
                 self._at.insert_order(self.stock_y_id, price=order_book_y.asks[0].price, volume=self._missing_hedge, side="bid", order_type="ioc")
                 logger.info(f"Inserting IOC bid on {self.stock_y_id} to finish filling hedge price {order_book_y.asks[0].price} quantity {self._missing_hedge}")
-            
+
             post_limit_position_y = self._at.get_position(self.stock_y_id)
             change_in_position = post_limit_position_y - self._internal_position_y
             self._internal_position_y = post_limit_position_y
